@@ -31,7 +31,165 @@
 #include <QGroupBox>
 #include <QGridLayout>
 #include <QSpinBox>
+#include <QSettings>
 #include "plots.h"
+
+namespace
+{
+
+// A custom "save file" dialog, which allows us to expose some additional options 
+class ExtractSymbolsDialog
+    : public QFileDialog
+{
+public:
+    ExtractSymbolsDialog()
+        : outputTypeGroup("File type", this)
+        , outputTypeLayout(&outputTypeGroup)
+        , csvDial("CSV", &outputTypeGroup)
+        , binaryDial("LE IEEE-754", &outputTypeGroup)
+        , appendReplaceGroup("Behaviour", this)
+        , appendReplaceLayout(&appendReplaceGroup)
+        , appendDial("Append", &appendReplaceGroup)
+        , replaceDial("Replace", &appendReplaceGroup)
+    {
+        setFileMode(QFileDialog::AnyFile);
+        setOption(QFileDialog::DontUseNativeDialog, true);
+
+        outputTypeLayout.addWidget(&csvDial);
+        outputTypeLayout.addWidget(&binaryDial);
+
+        appendReplaceLayout.addWidget(&appendDial);
+        appendReplaceLayout.addWidget(&replaceDial);
+
+        QGridLayout* dialogLayout = findChild<QGridLayout*>();
+        dialogLayout->addWidget(&outputTypeGroup, 4, 1);
+        dialogLayout->addWidget(&appendReplaceGroup, 4, 2);
+
+        // Restore settings
+        QSettings settings;
+        QByteArray savedState = settings.value("ExtractSymbolsDialogState").toByteArray();
+        restoreState(savedState);
+        
+        if(settings.value("ExtractSymbolsFormat").toInt() == 0)
+        {
+            csvDial.setChecked(true);
+        }
+        else
+        {
+            binaryDial.setChecked(true);
+        }
+
+        if(settings.value("ExtractSymbolsAppendReplace").toInt() == 0)
+        {
+            appendDial.setChecked(true);
+        }
+        else
+        {
+            replaceDial.setChecked(true);
+        }
+    }
+
+    ~ExtractSymbolsDialog()
+    {
+        // Save dialog state
+        QSettings settings;
+        QByteArray dialogState = saveState();
+        settings.setValue("ExtractSymbolsDialogState", dialogState);
+
+        int selectedFormat = binaryDial.isChecked();
+        int selectedWriteMode = replaceDial.isChecked();
+        settings.setValue("ExtractSymbolsFormat", selectedFormat);
+        settings.setValue("ExtractSymbolsAppendReplace", selectedWriteMode);
+    }
+
+    struct SampleWriter;
+
+    // Return a writer struct, depending on the options specified by the user
+    std::unique_ptr<SampleWriter> getSampleWriter()
+    {
+        QFile* outFile = new QFile(selectedFiles()[0]);
+
+        QFlags<QIODevice::OpenModeFlag> flags = QIODevice::WriteOnly;
+        if (appendDial.isChecked()) { flags |= QIODevice::Append; }
+        if (replaceDial.isChecked()) { flags |= QIODevice::Truncate; }
+        outFile->open( flags );
+
+        if (binaryDial.isChecked())
+        {
+            return std::unique_ptr<SampleWriter>(new BinarySampleWriter(outFile));
+        }
+        else
+        {
+            Q_ASSERT(csvDial.isChecked());
+            return std::unique_ptr<SampleWriter>(new CSVSampleWriter(outFile));
+        }
+    }
+
+    QGroupBox outputTypeGroup;
+    QVBoxLayout outputTypeLayout;
+    QRadioButton csvDial;
+    QRadioButton binaryDial;
+
+    QGroupBox appendReplaceGroup;
+    QVBoxLayout appendReplaceLayout;
+    QRadioButton appendDial;
+    QRadioButton replaceDial;
+    
+    // A simple virtual interface allowing us to write samples in different formats
+    struct SampleWriter
+    {
+        SampleWriter(QFile* outFile) : output(outFile) {}
+        virtual ~SampleWriter()
+        {
+            delete output;
+        }
+        virtual void write(float sample) = 0;
+        QFile* output;
+    };
+
+    struct BinarySampleWriter
+        : public SampleWriter
+    {
+        BinarySampleWriter(QFile* out) : SampleWriter(out) {}
+        virtual void write(float sample) override
+        {
+            union
+            {
+                uint32_t i;
+                float f;
+            } conv;
+            conv.f = sample;
+            uint32_t leIntSample = htole32(conv.i);
+            const char* csample = reinterpret_cast<const char*>(&leIntSample);
+            output->write(csample, sizeof(sample));
+        }
+    };
+
+    struct CSVSampleWriter
+        : public SampleWriter
+    {
+        CSVSampleWriter(QFile* out) : SampleWriter(out), hasWritten(false) {}
+        ~CSVSampleWriter()
+        {
+            output->write("\n");
+        }
+        virtual void write(float sample) override
+        {
+            if(hasWritten)
+            {
+                output->write(",");
+            }
+
+            QString formatted;
+            formatted.setNum(sample);
+            output->write(formatted.toUtf8());
+            hasWritten = true;
+        }
+
+        bool hasWritten;
+    };
+};
+}
 
 PlotView::PlotView(InputSource *input) : cursors(this), viewRange({0, 0})
 {
@@ -204,16 +362,20 @@ void PlotView::extractSymbols(std::shared_ptr<AbstractSampleSource> src)
     auto floatSrc = std::dynamic_pointer_cast<SampleSource<float>>(src);
     if (!floatSrc)
         return;
-    auto samples = floatSrc->getSamples(selectedSamples.minimum, selectedSamples.length());
-    auto step = (float)selectedSamples.length() / cursors.segments();
-    auto symbols = std::vector<float>();
-    for (auto i = step / 2; i < selectedSamples.length(); i += step)
+
+    ExtractSymbolsDialog saveFile;
+    if(saveFile.exec())
     {
-        symbols.push_back(samples[i]);
+        std::unique_ptr<ExtractSymbolsDialog::SampleWriter> outFile = saveFile.getSampleWriter();
+
+        auto samples = floatSrc->getSamples(selectedSamples.minimum, selectedSamples.length());
+        auto step = (float)selectedSamples.length() / cursors.segments();
+
+        for (auto i = step / 2; i < selectedSamples.length(); i += step)
+        {
+            outFile->write(samples[i]);
+        }
     }
-    for (auto f : symbols)
-        std::cout << f << ", ";
-    std::cout << std::endl << std::flush;
 }
 
 void PlotView::exportSamples(std::shared_ptr<AbstractSampleSource> src, SampleType type)
